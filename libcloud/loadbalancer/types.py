@@ -39,6 +39,7 @@ class Provider(object):
     ELB = 'elb'
     CLOUDSTACK = 'cloudstack'
     GCE = 'gce'
+    OPENSTACK = 'openstack'
 
     # Deprecated
     RACKSPACE_US = 'rackspace_us'
