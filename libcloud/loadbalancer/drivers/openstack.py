@@ -22,7 +22,7 @@ from libcloud.loadbalancer.base import LoadBalancer, Member, Driver, Algorithm
 from libcloud.loadbalancer.types import State
 from libcloud.compute.drivers.openstack import OpenStackComputeConnection, OpenStack_1_1_NodeDriver, OpenStack_1_1_FloatingIpAddress
 from neutronclient.neutron import client as nclient
-from neutronclient.common.exceptions import NeutronClientException
+from neutronclient.common.exceptions import NotFound, NeutronClientException
 
 DEFAULT_ALGORITHM = Algorithm.ROUND_ROBIN
 
@@ -106,12 +106,46 @@ class OpenStackLBDriver(Driver):
         """
         balancers = []
         for npool in self.ex_list_pools():
-            vip = self.ex_get_vip( npool['vip_id'] )
-            port_obj = self.ex_get_port("vip-" + vip.id) # port name: "vip-[vip_id]"
-            if port_obj: # not None
-                floating_ip = self.ex_get_floating_ip_by_port_id(port_obj['id'])
-                balancers.append(self._to_loadbalancer(self._to_pool(npool), floating_ip, vip))
+            balancers.append( self.get_balancer_neutron( npool ) )
         return balancers
+
+    def get_balancer_neutron(self, neutron_pool):
+        """
+        Return a :class:`LoadBalancer` object.
+        :param  neutron_pool: Object returned by neutronclient
+        :param: neutron_pool: ``dict``
+        :param  balancer_id: Name of load balancer you wish to fetch.
+                            For OpenStack, this is the id of the Pool.
+        :param  balancer_id: ``str``
+
+        :rtype: :class:`LoadBalancer`
+        """
+        try:
+            vip = self.ex_get_vip(neutron_pool['vip_id'])
+            port_obj = self.ex_get_port("vip-" + vip.id) # port name: "vip-[vip_id]"
+            if port_obj: # not None # TODO what if its wrong?
+                floating_ip = self.ex_get_floating_ip_by_port_id(port_obj['id'])
+            return self._to_loadbalancer(self._to_pool(neutron_pool), floating_ip, vip)
+        except NotFound:
+            return self._to_loadbalancer(self._to_pool(neutron_pool))
+
+    def get_balancer(self, balancer_id):
+        """
+        Return a :class:`LoadBalancer` object.
+
+        :param  balancer_id: Name of load balancer you wish to fetch.
+                            For OpenStack, this is the id of the Pool.
+        :param  balancer_id: ``str``
+
+        :rtype: :class:`LoadBalancer`
+        """
+        # Improvement: look for?
+        #for vip in self.ex_list_vips(): # TODO implement ex_list_vips!
+        #    if balancer_id == vip['pool_id']:
+        #            vid = vip['id']
+        #            break
+        pool = self.ex_get_pool(balancer_id)
+        return self._to_loadbalancer(pool)
 
     def create_balancer(self, name, port, protocol, algorithm, members,
                         ex_region=None, ex_healthchecks=None, ex_address=None,
@@ -180,8 +214,8 @@ class OpenStackLBDriver(Driver):
                     floating_ip = self.ex_attach_floating_ip_to_port( floating_ip, port_id )
             except NeutronClientException as ne:
                 # destroy the Pool and the Vip
-                self.ex_delete_vip(vip.id)
-                self.ex_delete_pool(pool.id)
+                vip.destroy()
+                pool.destroy()
                 raise ne
         
         added_members = []
@@ -194,23 +228,12 @@ class OpenStackLBDriver(Driver):
                 for member_id in added_members:
                     self.neutron.delete_member(member_id)
                 # destroy the Pool and the Vip
-                self.ex_delete_vip(vip.id)
-                self.ex_delete_pool(pool.id)
+                vip.destroy()
+                pool.destroy()
                 break # end for loop
         
         # Reformat forwarding rule to LoadBalancer object
         return self._to_loadbalancer(pool, floating_ip, vip)
-
-    def _to_loadbalancer(self, pool, floating_ip=None, vip=None):
-        ip = None if floating_ip is None else floating_ip.ip_address
-        port = None if vip is None else vip.protocol_port
-        state = self._VIP_STATUS_TO_LB_STATE_MAP[pool.status] # will they be the same statuses?
-        return LoadBalancer(id=pool.id,
-                            name=pool.name, state=state,
-                            ip=ip,
-                            port=port,
-                            driver=self, extra=None)
-        # TODO fill extra with other useful info?
 
     def destroy_balancer(self, balancer):
         """
@@ -225,25 +248,28 @@ class OpenStackLBDriver(Driver):
         :return:  True if successful
         :rtype:   ``bool``
         """
-        destroy = balancer.extra['forwarding_rule'].destroy()
-        if destroy:
-            tp_destroy = balancer.extra['targetpool'].destroy()
-            return tp_destroy
-        else:
-            return destroy
+        pool = self.ex_get_pool(balancer)
+        try:
+            vip = self.ex_get_vip(pool.vip_id)
+            if not vip.destroy():
+                return False
+            else:
+                pool_destroy = pool.destroy()
+                return pool_destroy
+        except NotFound:
+            # no need to destroy an inexisting VIP
+            return pool.destroy()
 
-    def get_balancer(self, balancer_id):
-        """
-        Return a :class:`LoadBalancer` object.
-
-        :param  balancer_id: Name of load balancer you wish to fetch.
-                            For OpenStack, this is the id of the Pool.
-        :param  balancer_id: ``str``
-
-        :rtype: :class:`LoadBalancer`
-        """
-        pool = self.ex_get_pool(balancer_id)
-        return self._to_loadbalancer(pool)
+    def _to_loadbalancer(self, pool, floating_ip=None, vip=None):
+        ip = None if floating_ip is None else floating_ip.ip_address
+        port = None if vip is None else vip.protocol_port
+        state = self._VIP_STATUS_TO_LB_STATE_MAP[pool.status] # will they be the same statuses?
+        return LoadBalancer(id=pool.id,
+                            name=pool.name, state=state,
+                            ip=ip,
+                            port=port,
+                            driver=self, extra=None)
+        # TODO fill extra with other useful info?
 
     def balancer_attach_compute_node(self, balancer, node):
         """
@@ -381,8 +407,8 @@ class OpenStackLBDriver(Driver):
         return None if pool_obj is None else self._to_pool(pool_obj['pool'])
 
     def ex_delete_pool(self, pool_id):
-        self.neutron.delete_pool(pool_id)
-        # TODO check if it has been written!
+        print self.neutron.delete_pool(pool_id)
+        # TODO Capture the exception it throws if something goes wrong.
         return True
 
     def _to_pool(self, neutron_obj):
@@ -420,7 +446,7 @@ class OpenStackLBDriver(Driver):
 
     def ex_delete_vip(self, vip_id):
         self.neutron.delete_vip(vip_id)
-        # TODO check if it has been written!
+        # TODO Capture the exception it throws if something goes wrong.
         return True
 
     def _to_vip(self, neutron_obj):
