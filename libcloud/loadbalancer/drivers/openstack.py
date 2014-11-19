@@ -103,17 +103,15 @@ class OpenStackLBDriver(Driver):
         :type     ex_region: ``str`` or :class:`GCERegion` or ``None``
 
         :rtype: ``list`` of :class:`LoadBalancer`
-        """        
+        """
         balancers = []
-        for lb in self.ex_list_pools():
-	    vip = self.ex_get_vip( lb['vip_id'] )
-	    floating_ips = self.ex_list_floating_ips() # self.openstack does not return ports
-	    ip_obj = None
-	    for x in floating_ips:
-		if x['port_id'] == vip['port_id']:
-		    ip_obj = x['floating_ip_address']
-            balancers.append(self._pool_to_loadbalancer(lb, vip['protocol_port'], ip_obj))
-        return balancers        
+        for npool in self.ex_list_pools():
+            vip = self.ex_get_vip( npool['vip_id'] )
+            port_obj = self.ex_get_port("vip-" + vip.id) # port name: "vip-[vip_id]"
+            if port_obj: # not None
+                floating_ip = self.ex_get_floating_ip_by_port_id(port_obj['id'])
+                balancers.append(self._to_loadbalancer(self._to_pool(npool), floating_ip, vip))
+        return balancers
 
     def create_balancer(self, name, port, protocol, algorithm, members,
                         ex_region=None, ex_healthchecks=None, ex_address=None,
@@ -218,8 +216,8 @@ class OpenStackLBDriver(Driver):
         """
         Destroy a load balancer.
 
-        For GCE, this means destroying the associated forwarding rule, then
-        destroying the target pool that was attached to the forwarding rule.
+        For OpenStack, this means destroying the attached VIP, then
+        destroying the target pool that was associated with the VIP.
 
         :param  balancer: LoadBalancer which should be used
         :type   balancer: :class:`LoadBalancer`
@@ -324,9 +322,6 @@ class OpenStackLBDriver(Driver):
                 return net['subnets']
         return None
 
-    def ex_list_floating_ips(self):
-      return self.neutron.list_floatingips()['floatingips']
-
     def ex_get_floating_ip(self, ip_address):
         fip = self.openstack.ex_get_floating_ip(ip_address)
         if fip: # is not empty
@@ -336,6 +331,12 @@ class OpenStackLBDriver(Driver):
         self.ex_create_floating_ip(ip_address)
         # there should be only one result, so avoid returning it as a list
         return self.openstack.ex_get_floating_ip(ip_address)
+    
+    def ex_get_floating_ip_by_port_id(self, port_id):
+        for fip in self.neutron.list_floatingips()['floatingips']:
+            if fip['port_id'] == port_id:
+                return self._to_floating_ip(fip)
+        return None
 
     def ex_create_floating_ip(self, id_address):
         # More general ex_create_floating_ip() exists in self.openstack
