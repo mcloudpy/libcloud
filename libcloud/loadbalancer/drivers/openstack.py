@@ -21,6 +21,7 @@ except ImportError:
 from libcloud.loadbalancer.base import LoadBalancer, Member, Driver, Algorithm
 from libcloud.compute.drivers.openstack import OpenStackComputeConnection, OpenStack_1_1_NodeDriver
 from neutronclient.neutron import client as nclient
+from neutronclient.common.exceptions import NeutronClientException
 
 DEFAULT_ALGORITHM = Algorithm.ROUND_ROBIN
 
@@ -40,6 +41,7 @@ class OpenStackLBDriver(Driver):
         'SOURCE_IP': None, # TODO create new Algorithm?
     }
 
+
     def __init__(self, *args, **kwargs):
         self.openstack = OpenStack_1_1_NodeDriver(*args, **kwargs)
         
@@ -47,6 +49,11 @@ class OpenStackLBDriver(Driver):
         self.neutron = nclient.Client('2.0', username=self.openstack.key, password=self.openstack.secret, tenant_name=self.openstack._ex_tenant_name, auth_url=ex_force_auth_url)
 
         self.connection = self.openstack.connection
+        self.create_algorithm_to_value_map()
+
+    def create_algorithm_to_value_map(self):
+        for key, value in self._VALUE_TO_ALGORITHM_MAP.iteritems():
+            self._ALGORITHM_TO_VALUE_MAP[value] = key
 
     def _get_node_from_ip(self, ip):
         """
@@ -74,19 +81,6 @@ class OpenStackLBDriver(Driver):
         """
         return ['TCP', 'HTTP', 'HTTPS']
 
-    def ex_list_pools(self):
-	# TODO self.openstack.ex_list_loadbalancer
-	# no me aclaro con self.connection
-	# intento hacer a "http://bor.deusto.es:9696/v2.0/lb/pools.json",
-	# pero toma de base bor.deusto.es:8774/v2/a79090daa2d8497389eb610f26a51870
-	return self.neutron.list_pools()['pools']
-      
-    def ex_get_vip(self, vid):
-	return self.neutron.show_vip(vid)['vip']
-    
-    def ex_list_floatingips(self):
-      return self.neutron.list_floatingips()['floatingips']
-
     def list_balancers(self, ex_region=None):
         """
         List all loadbalancers
@@ -101,22 +95,23 @@ class OpenStackLBDriver(Driver):
         balancers = []
         for lb in self.ex_list_pools():
 	    vip = self.ex_get_vip( lb['vip_id'] )
-	    floating_ips = self.ex_list_floatingips() # self.openstack does not return ports
+	    floating_ips = self.ex_list_floating_ips() # self.openstack does not return ports
 	    ip_obj = None
 	    for x in floating_ips:
 		if x['port_id'] == vip['port_id']:
 		    ip_obj = x['floating_ip_address']
             balancers.append(self._pool_to_loadbalancer(lb, vip['protocol_port'], ip_obj))
-        return balancers
+        return balancers        
 
     def create_balancer(self, name, port, protocol, algorithm, members,
                         ex_region=None, ex_healthchecks=None, ex_address=None,
-                        ex_session_affinity=None):
+                        ex_session_affinity=None, ex_network_name=None,
+                        ex_description=None): # or OpenStackNetwork?
         """
         Create a new load balancer instance.
 
-        For GCE, this means creating a forwarding rule and a matching target
-        pool, then adding the members to the target pool.
+        For OpenStack, this means creating a Pool and its VIP,
+        then adding the members to the target pool.
 
         :param  name: Name of the new load balancer (required)
         :type   name: ``str``
@@ -125,8 +120,8 @@ class OpenStackLBDriver(Driver):
                       on, defaults to all ports.  Examples: '80', '5000-5999'
         :type   port: ``str``
 
-        :param  protocol: Load balancer protocol.  Should be 'tcp' or 'udp',
-                          defaults to 'tcp'.
+        :param  protocol: Load balancer protocol.  Should be 'TCP', 'HTTP' or 'HTTPS',
+                          defaults to 'TCP'.
         :type   protocol: ``str``
 
         :param  members: List of Members to attach to balancer.  Can be Member
@@ -136,8 +131,7 @@ class OpenStackLBDriver(Driver):
                          'port' attribute of the members is ignored.
         :type   members: ``list`` of :class:`Member` or :class:`Node`
 
-        :param  algorithm: Load balancing algorithm.  Ignored for GCE which
-                           uses a hashing-based algorithm.
+        :param  algorithm: Load balancing algorithm.
         :type   algorithm: :class:`Algorithm` or ``None``
 
         :keyword  ex_region:  Optional region to create the load balancer in.
@@ -152,7 +146,7 @@ class OpenStackLBDriver(Driver):
 
         :keyword  ex_address: Optional static address object to be assigned to
                               the load balancer.
-        :type     ex_address: C{GCEAddress}
+        :type     ex_address: TODO
 
         :keyword  ex_session_affinity: Optional algorithm to use for session
                                        affinity.  This will modify the hashing
@@ -163,38 +157,48 @@ class OpenStackLBDriver(Driver):
         :return:  LoadBalancer object
         :rtype:   :class:`LoadBalancer`
         """
-        node_list = []
+        pool_obj = self.ex_create_pool(name, protocol, algorithm, ex_network_name, ex_description)
+        pool_id = pool_obj['id']
+        
+        vip_obj = self.ex_create_vip(name, port, protocol, pool_obj['subnet_id'], pool_id)
+        vip_id = vip_obj['id']
+        
+        if ex_address:
+            try:
+                floating_ip = self.ex_get_floating_ip(ex_address)
+                port_obj = self.ex_get_port("vip-" + vip_id) # port name: "vip-[vip_id]"
+                if port_obj and 'id' in port_obj:
+                    port_id = port_obj['id']
+                    floatingip_obj = self.ex_attach_floating_ip_to_port( floating_ip.id, port_id )
+            except NeutronClientException as ne:
+                # destroy the Pool and the Vip
+                self.neutron.delete_vip(vip_id)
+                self.neutron.delete_pool(pool_id)
+                raise ne
+        
+        added_members = []
         for member in members:
-            # Member object
-            if hasattr(member, 'ip'):
-                if member.extra.get('node'):
-                    node_list.append(member.extra['node'])
-                else:
-                    node_list.append(self._get_node_from_ip(member.ip))
-            # Node object
-            elif hasattr(member, 'name'):
-                node_list.append(member)
-            # Assume it's a node name otherwise
-            else:
-                node_list.append(self.openstack.ex_get_node(member, 'all'))
-
-        # Create Target Pool
-        tp_name = '%s-tp' % name
-        targetpool = self.openstack.ex_create_targetpool(
-            tp_name, region=ex_region, healthchecks=ex_healthchecks,
-            nodes=node_list, session_affinity=ex_session_affinity)
-
-        # Create the Forwarding rule, but if it fails, delete the target pool.
-        try:
-            forwarding_rule = self.openstack.ex_create_forwarding_rule(
-                name, targetpool, region=ex_region, protocol=protocol,
-                port_range=port, address=ex_address)
-        except:
-            targetpool.destroy()
-            raise
-
+            try:
+                member_id = self.ex_create_member(pool_id, member)
+                added_members.append(member_id)
+            except NeutronClientException as ne: 
+                # If it fails at any step, delete the target pool neutron.
+                for member_id in added_members:
+                    self.neutron.delete_member(member_id)
+                # destroy the Pool and the Vip
+                self.neutron.delete_vip(vip_id)
+                self.neutron.delete_pool(pool_id)
+                break # end for loop
+        
         # Reformat forwarding rule to LoadBalancer object
-        return self._pool_to_loadbalancer(forwarding_rule)
+        return self._pool_to_loadbalancer(pool_obj, floatingip_obj['floatingip'], vip_obj)
+    
+    def _pool_to_loadbalancer(self, pool, floatingip, vip):
+        return LoadBalancer(id=pool['id'],
+                            name=pool['name'], state=pool['status'],
+                            ip=floatingip['floating_ip_address'],
+                            port=vip['protocol_port'],
+                            driver=self, extra=None)
 
     def destroy_balancer(self, balancer):
         """
@@ -294,6 +298,84 @@ class OpenStackLBDriver(Driver):
         return [self._node_to_member(n, balancer) for n in
                 balancer.extra['targetpool'].nodes]
 
+    def ex_list_pools(self):
+        # TODO self.openstack.ex_list_loadbalancer
+        # no me aclaro con self.connection
+        # intento hacer a "http://bor.deusto.es:9696/v2.0/lb/pools.json",
+        # pero toma de base bor.deusto.es:8774/v2/a79090daa2d8497389eb610f26a51870
+        return self.neutron.list_pools()['pools']
+      
+    def ex_get_vip(self, vid):
+        return self.neutron.show_vip(vid)['vip']
+  
+    def ex_get_network_subnet_ids(self, network_name):
+        for net in self.neutron.list_networks()['networks']:
+            if net['name'] == network_name:
+                return net['subnets']
+        return None
+
+    def ex_list_floating_ips(self):
+      return self.neutron.list_floatingips()['floatingips']
+
+    def ex_get_floating_ip(self, ip_address):
+        fip = self.openstack.ex_get_floating_ip(ip_address)
+        if fip: # is not empty
+            return fip[0]
+        else: # try to "create" (allocate) it
+            self.ex_create_floating_ip(ip_address)
+            # there should be only one result, so avoid returning it as a list
+            return self.openstack.ex_get_floating_ip(ip_address)[0]
+
+    def ex_create_floating_ip(self, id_address):
+        # More general ex_create_floating_ip() exists in self.openstack
+        request = {'floatingip': id_address} # we could associate it in the same operation
+        return self.neutron.create_floatingip(request)
+
+    def ex_attach_floating_ip_to_port(self, floating_ip_id, port_id):
+        # More specific ex_attach_floating_ip_to_node exist in OpenStack class
+        request = {'port_id': port_id}
+        return self.neutron.update_floatingip(floating_ip_id, {'floatingip': request})
+
+    def ex_get_port(self, port_name):
+        for port in self.neutron.list_ports()['ports']:
+            if port['name'] == port_name:
+                return port
+        return None
+
+    def ex_create_pool(self, name, protocol, algorithm, ex_network_name, ex_description):
+        subnet_id = self.ex_get_network_subnet_ids(ex_network_name)[0]
+        pool = {'subnet_id':subnet_id, 
+            'lb_method':self._algorithm_to_value(algorithm), 
+            'protocol':protocol, 
+            'name':name, 
+            'description':ex_description, 
+            'admin_state_up':True}
+        pool_obj = self.neutron.create_pool({'pool':pool})
+        return None if pool_obj is None else pool_obj['pool']
+
+    def ex_create_vip(self, name, port, protocol, subnet_id, pool_id):
+        vip = {'protocol':protocol, 
+            'name':"vip_" + name, 
+            'subnet_id': subnet_id,
+            'pool_id':pool_id, 
+            'protocol_port':port, 
+            'admin_state_up':True}
+        vip_obj = self.neutron.create_vip({'vip':vip})
+        return None if vip_obj is None else vip_obj['vip']
+
+    def ex_create_member(self, pool_id, member):
+        node = {'address':member.ip, 
+            'protocol_port':member.port, 
+            'pool_id':pool_id, 
+            'admin_state_up':True}
+        # Member object
+        weight = member.extra.get('weight')
+        if weight:
+            node['weight'] = weight
+        
+        mobj = self.neutron.create_member({'member':node})
+        return None if mobj is None else mobj['member']['id']
+
     def ex_create_healthcheck(self, *args, **kwargs):
         return self.openstack.ex_create_healthcheck(*args, **kwargs)
 
@@ -367,10 +449,3 @@ class OpenStackLBDriver(Driver):
         extra = {'node': node}
         return Member(id=member_id, ip=member_ip, port=balancer.port,
                       balancer=balancer, extra=extra)
-
-    def _pool_to_loadbalancer(self, pool, port, floatingip):      
-        return LoadBalancer(id=pool['id'],
-                            name=pool['name'], state=pool['status'],
-                            ip=floatingip,
-                            port=port,
-                            driver=self, extra=None)
