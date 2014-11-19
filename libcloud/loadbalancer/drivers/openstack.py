@@ -19,7 +19,8 @@ except ImportError:
     import json  # NOQA
 
 from libcloud.loadbalancer.base import LoadBalancer, Member, Driver, Algorithm
-from libcloud.compute.drivers.openstack import OpenStackComputeConnection, OpenStack_1_1_NodeDriver
+from libcloud.loadbalancer.types import State
+from libcloud.compute.drivers.openstack import OpenStackComputeConnection, OpenStack_1_1_NodeDriver, OpenStack_1_1_FloatingIpAddress
 from neutronclient.neutron import client as nclient
 from neutronclient.common.exceptions import NeutronClientException
 
@@ -34,13 +35,24 @@ class OpenStackLBDriver(Driver):
     api_name = 'openstack'
     name = 'OpenStack'
     website = 'http://openstack.org/'
-    
+
     _VALUE_TO_ALGORITHM_MAP = {
         'ROUND_ROBIN': Algorithm.ROUND_ROBIN,
         'LEAST_CONNECTIONS': Algorithm.LEAST_CONNECTIONS,
         'SOURCE_IP': None, # TODO create new Algorithm?
     }
 
+    # Statuses extracted from:
+    #    https://wiki.openstack.org/wiki/Neutron/LBaaS/API
+    _VIP_STATUS_TO_LB_STATE_MAP = {
+        'ACTIVE': State.RUNNING,
+        'PENDING_CREATE': State.PENDING,
+        'PENDING_UPDATE': State.PENDING,
+        'PENDING_DELETE': State.PENDING,
+        'INACTIVE': State.UNKNOWN,
+        'ERROR': State.ERROR,
+        #'???': State.DELETED,
+    }
 
     def __init__(self, *args, **kwargs):
         self.openstack = OpenStack_1_1_NodeDriver(*args, **kwargs)
@@ -157,48 +169,50 @@ class OpenStackLBDriver(Driver):
         :return:  LoadBalancer object
         :rtype:   :class:`LoadBalancer`
         """
-        pool_obj = self.ex_create_pool(name, protocol, algorithm, ex_network_name, ex_description)
-        pool_id = pool_obj['id']
-        
-        vip_obj = self.ex_create_vip(name, port, protocol, pool_obj['subnet_id'], pool_id)
-        vip_id = vip_obj['id']
+        pool = self.ex_create_pool(name, protocol, algorithm, ex_network_name, ex_description)
+        vip = self.ex_create_vip(name, port, protocol, pool.subnet_id, pool.id)
         
         if ex_address:
             try:
                 floating_ip = self.ex_get_floating_ip(ex_address)
-                port_obj = self.ex_get_port("vip-" + vip_id) # port name: "vip-[vip_id]"
+                port_obj = self.ex_get_port("vip-" + vip.id) # port name: "vip-[vip_id]"
                 if port_obj and 'id' in port_obj:
                     port_id = port_obj['id']
-                    floatingip_obj = self.ex_attach_floating_ip_to_port( floating_ip.id, port_id )
+                    # floating_ip attribute updated (although is not really needed)
+                    floating_ip = self.ex_attach_floating_ip_to_port( floating_ip, port_id )
             except NeutronClientException as ne:
                 # destroy the Pool and the Vip
-                self.neutron.delete_vip(vip_id)
-                self.neutron.delete_pool(pool_id)
+                self.ex_delete_vip(vip.id)
+                self.ex_delete_pool(pool.id)
                 raise ne
         
         added_members = []
         for member in members:
             try:
-                member_id = self.ex_create_member(pool_id, member)
+                member_id = self.ex_create_member(pool.id, member)
                 added_members.append(member_id)
             except NeutronClientException as ne: 
                 # If it fails at any step, delete the target pool neutron.
                 for member_id in added_members:
                     self.neutron.delete_member(member_id)
                 # destroy the Pool and the Vip
-                self.neutron.delete_vip(vip_id)
-                self.neutron.delete_pool(pool_id)
+                self.ex_delete_vip(vip.id)
+                self.ex_delete_pool(pool.id)
                 break # end for loop
         
         # Reformat forwarding rule to LoadBalancer object
-        return self._pool_to_loadbalancer(pool_obj, floatingip_obj['floatingip'], vip_obj)
-    
-    def _pool_to_loadbalancer(self, pool, floatingip, vip):
-        return LoadBalancer(id=pool['id'],
-                            name=pool['name'], state=pool['status'],
-                            ip=floatingip['floating_ip_address'],
-                            port=vip['protocol_port'],
+        return self._to_loadbalancer(pool, floating_ip, vip)
+
+    def _to_loadbalancer(self, pool, floating_ip=None, vip=None):
+        ip = None if floating_ip is None else floating_ip.ip_address
+        port = None if vip is None else vip.protocol_port
+        state = self._VIP_STATUS_TO_LB_STATE_MAP[pool.status] # will they be the same statuses?
+        return LoadBalancer(id=pool.id,
+                            name=pool.name, state=state,
+                            ip=ip,
+                            port=port,
                             driver=self, extra=None)
+        # TODO fill extra with other useful info?
 
     def destroy_balancer(self, balancer):
         """
@@ -224,15 +238,14 @@ class OpenStackLBDriver(Driver):
         """
         Return a :class:`LoadBalancer` object.
 
-        :param  balancer_id: Name of load balancer you wish to fetch.  For GCE,
-                             this is the name of the associated forwarding
-                             rule.
+        :param  balancer_id: Name of load balancer you wish to fetch.
+                            For OpenStack, this is the id of the Pool.
         :param  balancer_id: ``str``
 
         :rtype: :class:`LoadBalancer`
         """
-        fwr = self.openstack.ex_get_forwarding_rule(balancer_id)
-        return self._pool_to_loadbalancer(fwr)
+        pool = self.ex_get_pool(balancer_id)
+        return self._to_loadbalancer(pool)
 
     def balancer_attach_compute_node(self, balancer, node):
         """
@@ -304,10 +317,7 @@ class OpenStackLBDriver(Driver):
         # intento hacer a "http://bor.deusto.es:9696/v2.0/lb/pools.json",
         # pero toma de base bor.deusto.es:8774/v2/a79090daa2d8497389eb610f26a51870
         return self.neutron.list_pools()['pools']
-      
-    def ex_get_vip(self, vid):
-        return self.neutron.show_vip(vid)['vip']
-  
+
     def ex_get_network_subnet_ids(self, network_name):
         for net in self.neutron.list_networks()['networks']:
             if net['name'] == network_name:
@@ -320,27 +330,43 @@ class OpenStackLBDriver(Driver):
     def ex_get_floating_ip(self, ip_address):
         fip = self.openstack.ex_get_floating_ip(ip_address)
         if fip: # is not empty
-            return fip[0]
-        else: # try to "create" (allocate) it
-            self.ex_create_floating_ip(ip_address)
-            # there should be only one result, so avoid returning it as a list
-            return self.openstack.ex_get_floating_ip(ip_address)[0]
+            return fip
+        
+        # try to "create" (allocate) it
+        self.ex_create_floating_ip(ip_address)
+        # there should be only one result, so avoid returning it as a list
+        return self.openstack.ex_get_floating_ip(ip_address)
 
     def ex_create_floating_ip(self, id_address):
         # More general ex_create_floating_ip() exists in self.openstack
         request = {'floatingip': id_address} # we could associate it in the same operation
         return self.neutron.create_floatingip(request)
 
-    def ex_attach_floating_ip_to_port(self, floating_ip_id, port_id):
+    def ex_attach_floating_ip_to_port(self, floating_ip, port_id):
         # More specific ex_attach_floating_ip_to_node exist in OpenStack class
         request = {'port_id': port_id}
-        return self.neutron.update_floatingip(floating_ip_id, {'floatingip': request})
+        fip = self.neutron.update_floatingip(floating_ip.id, {'floatingip': request})
+        return None if fip is None else self._to_floating_ip(fip['floatingip'])
+
+    def _to_floating_ip(self, neutron_obj):
+        return OpenStack_1_1_FloatingIpAddress(id=neutron_obj['id'],
+                                               ip_address=neutron_obj['floating_ip_address'],
+                                               pool=None,
+                                               # FIXME a floating_ip can be associated to a balancer too
+                                               node_id=None,
+                                               driver=self)
 
     def ex_get_port(self, port_name):
         for port in self.neutron.list_ports()['ports']:
             if port['name'] == port_name:
                 return port
         return None
+
+    def ex_get_pool(self, pool_id):
+        p = self.neutron.show_pool(pool_id)
+        if p is None:
+            return None
+        return self._to_pool(p['pool'])
 
     def ex_create_pool(self, name, protocol, algorithm, ex_network_name, ex_description):
         subnet_id = self.ex_get_network_subnet_ids(ex_network_name)[0]
@@ -351,17 +377,67 @@ class OpenStackLBDriver(Driver):
             'description':ex_description, 
             'admin_state_up':True}
         pool_obj = self.neutron.create_pool({'pool':pool})
-        return None if pool_obj is None else pool_obj['pool']
+        return None if pool_obj is None else self._to_pool(pool_obj['pool'])
+
+    def ex_delete_pool(self, pool_id):
+        self.neutron.delete_pool(pool_id)
+        # TODO check if it has been written!
+        return True
+
+    def _to_pool(self, neutron_obj):
+        return OpenStack_2_Pool(neutron_obj['id'],
+                                neutron_obj['name'],
+                                neutron_obj['description'],
+                                neutron_obj['status'],
+                                neutron_obj['protocol'],
+                                neutron_obj['admin_state_up'],
+                                neutron_obj['lb_method'],
+                                neutron_obj['subnet_id'],
+                                neutron_obj['vip_id'],
+                                neutron_obj['provider'],
+                                neutron_obj['status_description'],
+                                neutron_obj['members'],
+                                neutron_obj['health_monitors'],
+                                neutron_obj['health_monitors_status'],
+                                self )
+
+    def ex_get_vip(self, vid):
+        v = self.neutron.show_vip(vid)
+        if v is None:
+            return None
+        return self._to_vip(v['vip'])
 
     def ex_create_vip(self, name, port, protocol, subnet_id, pool_id):
-        vip = {'protocol':protocol, 
-            'name':"vip_" + name, 
-            'subnet_id': subnet_id,
-            'pool_id':pool_id, 
-            'protocol_port':port, 
-            'admin_state_up':True}
+        vip = { 'protocol':protocol, 
+                'name':"vip_" + name, 
+                'subnet_id': subnet_id,
+                'pool_id':pool_id, 
+                'protocol_port':port, 
+                'admin_state_up':True }
         vip_obj = self.neutron.create_vip({'vip':vip})
-        return None if vip_obj is None else vip_obj['vip']
+        return None if vip_obj is None else self._to_vip(vip_obj['vip'])
+
+    def ex_delete_vip(self, vip_id):
+        self.neutron.delete_vip(vip_id)
+        # TODO check if it has been written!
+        return True
+
+    def _to_vip(self, neutron_obj):
+        return OpenStack_2_VIP( neutron_obj['id'],
+                                neutron_obj['name'],
+                                neutron_obj['description'],
+                                neutron_obj['status'],
+                                neutron_obj['protocol'],
+                                neutron_obj['admin_state_up'],
+                                neutron_obj['subnet_id'],
+                                neutron_obj['tenant_id'],
+                                neutron_obj['connection_limit'],
+                                neutron_obj['pool_id'],
+                                neutron_obj['session_persistence'],
+                                neutron_obj['address'],
+                                neutron_obj['protocol_port'],
+                                neutron_obj['port_id'],
+                                self )
 
     def ex_create_member(self, pool_id, member):
         node = {'address':member.ip, 
@@ -449,3 +525,104 @@ class OpenStackLBDriver(Driver):
         extra = {'node': node}
         return Member(id=member_id, ip=member_ip, port=balancer.port,
                       balancer=balancer, extra=extra)
+
+#===============================================================================
+# "status":"ACTIVE",
+# "protocol":"HTTP",
+# "description":"",
+# "admin_state_up":true,
+# "subnet_id":"8032909d-47a1-4715-90af-5153ffe39861",
+# "tenant_id":"83657cfcdfe44cd5920adaf26c48ceea",
+# "connection_limit":1000,
+# "pool_id":"72741b06-df4d-4715-b142-276b6bce75ab",
+# "session_persistence":{
+#     "cookie_name":"MyAppCookie",
+#     "type":"APP_COOKIE"
+# },
+# "address":"10.0.0.10",
+# "protocol_port":80,
+# "port_id":"b5a743d6-056b-468b-862d-fb13a9aa694e",
+## "id":"4ec89087-d057-4e2c-911f-60a3b47ee304",
+## "name":"my-vip"
+#===============================================================================
+class OpenStack_2_VIP(object):
+    """A OpenStack VIP class."""
+    def __init__(self, id, name, description, status, protocol, admin_state_up,
+                 subnet_id, tenant_id, connection_limit, pool_id,
+                 session_persistence, address, protocol_port, port_id, driver):
+        self.id = str(id)
+        self.name = name
+        self.description = description
+        self.status = status
+        self.protocol = protocol
+        self.admin_state_up = admin_state_up
+        self.subnet_id = subnet_id
+        self.tenant_id = tenant_id
+        self.connection_limit = connection_limit
+        self.pool_id = pool_id
+        self.session_persistence = session_persistence
+        self.address = address
+        self.protocol_port = protocol_port
+        self.port_id = port_id
+        self.driver = driver
+
+    def destroy(self):
+        """
+        Destroy this VIP.
+
+        :return:  True if successful
+        :rtype:   ``bool``
+        """
+        return self.driver.ex_delete_vip(self.id)
+
+    def __repr__(self):
+        return '<OpenStack_2_VIP id="%s" name="%s" protocol="%s" status="%s">' % (
+            self.id, self.name, self.protocol, self.status)
+
+#===============================================================================
+# FIXME: Difference between what the API returns and [1]. I should check the API version.
+# [1] http://docs.openstack.org/api/openstack-network/2.0/content/GET_showPool__v2.0_pools__pool_id__lbaas_ext_ops_pool.html 
+#===============================================================================
+# Documentation says:
+# id, name, description, status, protocol, admin_state_up, tenant_id, members,
+# lb_algorithm, session_persistence & healthmonitor_id.
+#===============================================================================
+# API returns:
+# id, name, description, status, protocol, admin_state_up, tenant_id, members,
+# lb_method, subnet_id, vip_id, provider, status_description, health_monitors &
+# health_monitors_status.
+#===============================================================================
+class OpenStack_2_Pool(object):
+    """A OpenStack VIP class."""
+    def __init__(self, id, name, description, status, protocol, admin_state_up,
+                 lb_method, subnet_id, vip_id, provider, status_description,
+                 members, health_monitors, health_monitors_status,
+                 driver):
+        self.id = str(id)
+        self.name = name
+        self.description = description
+        self.status = status
+        self.protocol = protocol
+        self.admin_state_up = admin_state_up
+        self.lb_method = lb_method
+        self.subnet_id = subnet_id
+        self.vip_id = vip_id
+        self.provider = provider
+        self.status_description = status_description
+        self.members = members
+        self.health_monitors = health_monitors
+        self.health_monitors_status = health_monitors_status
+        self.driver = driver
+
+    def destroy(self):
+        """
+        Destroy this Pool.
+
+        :return:  True if successful
+        :rtype:   ``bool``
+        """
+        return self.driver.ex_delete_pool(self.id)
+
+    def __repr__(self):
+        return '<OpenStack_2_Pool id="%s" name="%s" protocol="%s" status="%s">' % (
+            self.id, self.name, self.protocol, self.status)
