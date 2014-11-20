@@ -25,7 +25,7 @@ from neutronclient.neutron import client as nclient
 from neutronclient.common.exceptions import NotFound, NeutronClientException
 
 DEFAULT_ALGORITHM = Algorithm.ROUND_ROBIN
-
+DEFAULT_SESSION_AFFINITY = None
 
 class OpenStackLBDriver(Driver):
     connectionCls = OpenStackComputeConnection
@@ -149,9 +149,10 @@ class OpenStackLBDriver(Driver):
         return self._to_loadbalancer(pool)
 
     def create_balancer(self, name, port, protocol, algorithm, members,
-                        ex_region=None, ex_healthchecks=None, ex_address=None,
+                        ex_region=None, ex_address=None,
                         ex_session_affinity=None, ex_network_name=None,
-                        ex_description=None): # or OpenStackNetwork?
+                        ex_description=None,
+                        ex_session_cookie_name=None): # or OpenStackNetwork?
         """
         Create a new load balancer instance.
 
@@ -184,11 +185,6 @@ class OpenStackLBDriver(Driver):
                               Driver.
         :type     ex_region:  C{GCERegion} or ``str``
 
-        :keyword  ex_healthchecks: Optional list of healthcheck objects or
-                                   names to add to the load balancer.
-        :type     ex_healthchecks: ``list`` of :class:`GCEHealthCheck` or
-                                   ``list`` of ``str``
-
         :keyword  ex_address: Optional static address object to be assigned to
                               the load balancer.
         :type     ex_address: TODO
@@ -198,12 +194,24 @@ class OpenStackLBDriver(Driver):
                                        algorithm such that a client will tend
                                        to stick to a particular Member.
         :type     ex_session_affinity: ``str``
+        :keyword  ex_session_cookie_name: Name of the application cookie where
+                                       session information will be stored.
+                                       It should only be added if the session affinity
+                                       is set to APP_COOKIE.
+        :type     ex_session_cookie_name: ``str``
 
         :return:  LoadBalancer object
         :rtype:   :class:`LoadBalancer`
         """
+        # Would it be better to throw custom exceptions?
+        assert ex_session_affinity in self.ex_list_session_affinities()
+        assert ex_session_affinity!='APP_COOKIE' or ex_session_cookie_name is not None, \
+            "If the session affinity is APP_COOKIE, you must also provide a name for the cookie."
+
+        
         pool = self.ex_create_pool(name, protocol, algorithm, ex_network_name, ex_description)
-        vip = self.ex_create_vip(name, port, protocol, pool.subnet_id, pool.id)
+        vip = self.ex_create_vip(name, port, protocol, pool.subnet_id, pool.id,
+                                     ex_session_affinity, ex_session_cookie_name)  
         
         if ex_address:
             try:
@@ -325,6 +333,16 @@ class OpenStackLBDriver(Driver):
         node = member.extra.get('node') or self._get_node_from_ip(member.ip)
         remove_node = balancer.extra['targetpool'].remove_node(node)
         return remove_node
+
+    def ex_list_session_affinities(self):
+        """
+        Return a list of supported session affinities (or persistences).
+
+        For OpenStack, this is simply a hardcoded list.
+
+        :rtype: ``list`` of ``str``
+        """
+        return ['DISABLED', 'SOURCE_IP', 'HTTP_COOKIE', 'APP_COOKIE']
 
     def balancer_list_members(self, balancer):
         """
@@ -453,13 +471,19 @@ class OpenStackLBDriver(Driver):
             return None
         return self._to_vip(v['vip'])
 
-    def ex_create_vip(self, name, port, protocol, subnet_id, pool_id):
+    def ex_create_vip(self, name, port, protocol, subnet_id, pool_id,
+                      session_affinity=None, session_cookie_name=None):
         vip = { 'protocol':protocol, 
                 'name':"vip_" + name, 
                 'subnet_id': subnet_id,
                 'pool_id':pool_id, 
                 'protocol_port':port, 
                 'admin_state_up':True }
+        if session_affinity:
+            vip['session_persistence'] = { 'type': session_affinity }
+            if session_cookie_name:
+                vip['session_persistence']['cookie_name'] = session_cookie_name
+                            
         vip_obj = self.neutron.create_vip({'vip':vip})
         return None if vip_obj is None else self._to_vip(vip_obj['vip'])
 
