@@ -61,9 +61,9 @@ class OpenStackLBDriver(Driver):
         self.neutron = nclient.Client('2.0', username=self.openstack.key, password=self.openstack.secret, tenant_name=self.openstack._ex_tenant_name, auth_url=ex_force_auth_url)
 
         self.connection = self.openstack.connection
-        self.create_algorithm_to_value_map()
+        self.__create_algorithm_to_value_map()
 
-    def create_algorithm_to_value_map(self):
+    def __create_algorithm_to_value_map(self):
         for key, value in self._VALUE_TO_ALGORITHM_MAP.iteritems():
             self._ALGORITHM_TO_VALUE_MAP[value] = key
 
@@ -106,10 +106,10 @@ class OpenStackLBDriver(Driver):
         """
         balancers = []
         for npool in self.ex_list_pools():
-            balancers.append( self.get_balancer_neutron( npool ) )
+            balancers.append( self._get_balancer_neutron( npool ) )
         return balancers
 
-    def get_balancer_neutron(self, neutron_pool):
+    def _get_balancer_neutron(self, neutron_pool):
         """
         Return a :class:`LoadBalancer` object.
         :param  neutron_pool: Object returned by neutronclient
@@ -275,12 +275,12 @@ class OpenStackLBDriver(Driver):
         state = self._VIP_STATUS_TO_LB_STATE_MAP[pool.status] # will they be the same statuses?
         already_included = ('id', 'name', 'status', 'driver')
         extras = self._get_extra_dict(pool, already_included)
+        # Should I fill "extra" with vip and floating_ip objects' useful info too?
         return LoadBalancer(id=pool.id,
                             name=pool.name, state=state,
                             ip=ip, port=port,
                             driver=self,
                             extra=extras)
-        # TODO fill extra with other useful info?
 
     def balancer_attach_compute_node(self, balancer, node):
         """
@@ -319,9 +319,11 @@ class OpenStackLBDriver(Driver):
 
     def balancer_detach_member(self, balancer, member):
         """
-        Detach member from balancer
+        Detach member from balancer (i.e., in OpenStack deletes it).
 
-        :param balancer: LoadBalancer which should be used
+        :param balancer: LoadBalancer which should be used.
+                        Note that the current OpenStack implementation
+                        does not actually use this parameter.
         :type  balancer: :class:`LoadBalancer`
 
         :param member: Member which should be used
@@ -330,9 +332,13 @@ class OpenStackLBDriver(Driver):
         :return: True if member detach was successful, otherwise False
         :rtype: ``bool``
         """
-        node = member.extra.get('node') or self._get_node_from_ip(member.ip)
-        remove_node = balancer.extra['targetpool'].remove_node(node)
-        return remove_node
+        #mobj = self.neutron.update_member( {'member': {'pool_id': None } } ) # returns error
+        try:
+            self.neutron.delete_member(member.id)
+            return True
+        except NotFound:
+            # IMO 'NotFound' exception would be much more descriptive that the boolean. :-S
+            return False
 
     def ex_list_session_affinities(self):
         """
@@ -459,6 +465,19 @@ class OpenStackLBDriver(Driver):
         nmember = self.neutron.show_member(member_id)
         return self._to_member(nmember['member'])
 
+    def ex_create_member(self, pool_id, member):
+        node = {'address':member.ip,
+                'protocol_port':member.port,
+                'pool_id':pool_id,
+                'admin_state_up':True}
+        # Member object
+        weight = member.extra.get('weight')
+        if weight:
+            node['weight'] = weight
+        
+        mobj = self.neutron.create_member({'member':node})
+        return None if mobj is None else mobj['member']['id']
+
     def _to_member(self, neutron_member):
         already_included = ('id', 'address', 'protocol_port')
         extras = self._get_extra_dict(neutron_member, already_included)
@@ -522,66 +541,8 @@ class OpenStackLBDriver(Driver):
                     if not hasattr(at_val, '__call__'): # not a function
                         extras[attr] = at_val
         return extras
-
-    def ex_create_member(self, pool_id, member):
-        node = {'address':member.ip,
-                'protocol_port':member.port,
-                'pool_id':pool_id,
-                'admin_state_up':True}
-        # Member object
-        weight = member.extra.get('weight')
-        if weight:
-            node['weight'] = weight
-        
-        mobj = self.neutron.create_member({'member':node})
-        return None if mobj is None else mobj['member']['id']
-
-    def ex_create_healthcheck(self, *args, **kwargs):
-        return self.openstack.ex_create_healthcheck(*args, **kwargs)
-
-    def ex_list_healthchecks(self):
-        return self.openstack.ex_list_healthchecks()
-
-    def ex_balancer_attach_healthcheck(self, balancer, healthcheck):
-        """
-        Attach a healthcheck to balancer
-
-        :param balancer: LoadBalancer which should be used
-        :type  balancer: :class:`LoadBalancer`
-
-        :param healthcheck: Healthcheck to add
-        :type  healthcheck: :class:`GCEHealthCheck`
-
-        :return: True if successful
-        :rtype:  ``bool``
-        """
-        return balancer.extra['targetpool'].add_healthcheck(healthcheck)
-
-    def ex_balancer_detach_healthcheck(self, balancer, healthcheck):
-        """
-        Detach healtcheck from balancer
-
-        :param balancer: LoadBalancer which should be used
-        :type  balancer: :class:`LoadBalancer`
-
-        :param healthcheck: Healthcheck to remove
-        :type  healthcheck: :class:`GCEHealthCheck`
-
-        :return: True if successful
-        :rtype: ``bool``
-        """
-        return balancer.extra['targetpool'].remove_healthcheck(healthcheck)
-
-    def ex_balancer_list_healthchecks(self, balancer):
-        """
-        Return list of healthchecks attached to balancer
-
-        :param  balancer: LoadBalancer which should be used
-        :type   balancer: :class:`LoadBalancer`
-
-        :rtype: ``list`` of :class:`HealthChecks`
-        """
-        return balancer.extra['healthchecks']
+    
+    # TODO add monitors' management!
 
     def _node_to_member(self, node, balancer):
         """
