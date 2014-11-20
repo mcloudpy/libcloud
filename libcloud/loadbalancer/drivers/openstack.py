@@ -57,7 +57,7 @@ class OpenStackLBDriver(Driver):
     def __init__(self, *args, **kwargs):
         self.openstack = OpenStack_1_1_NodeDriver(*args, **kwargs)
         
-        ex_force_auth_url = "http://bor.deusto.es:35357/v2.0"
+        ex_force_auth_url = "http://bor.deusto.es:35357/v2.0" # FIXME
         self.neutron = nclient.Client('2.0', username=self.openstack.key, password=self.openstack.secret, tenant_name=self.openstack._ex_tenant_name, auth_url=ex_force_auth_url)
 
         self.connection = self.openstack.connection
@@ -144,6 +144,7 @@ class OpenStackLBDriver(Driver):
         #    if balancer_id == vip['pool_id']:
         #            vid = vip['id']
         #            break
+        # TODO fix with balancer data?
         pool = self.ex_get_pool(balancer_id)
         return self._to_loadbalancer(pool)
 
@@ -264,11 +265,13 @@ class OpenStackLBDriver(Driver):
         ip = None if floating_ip is None else floating_ip.ip_address
         port = None if vip is None else vip.protocol_port
         state = self._VIP_STATUS_TO_LB_STATE_MAP[pool.status] # will they be the same statuses?
+        already_included = ('id', 'name', 'status', 'driver')
+        extras = self._get_extra_dict(pool, already_included)
         return LoadBalancer(id=pool.id,
                             name=pool.name, state=state,
-                            ip=ip,
-                            port=port,
-                            driver=self, extra=None)
+                            ip=ip, port=port,
+                            driver=self,
+                            extra=extras)
         # TODO fill extra with other useful info?
 
     def balancer_attach_compute_node(self, balancer, node):
@@ -332,8 +335,14 @@ class OpenStackLBDriver(Driver):
 
         :rtype: ``list`` of :class:`Member`
         """
-        return [self._node_to_member(n, balancer) for n in
-                balancer.extra['targetpool'].nodes]
+        # Recheck it just in case it has been updated
+        pool = self.ex_get_pool(balancer.id)
+        balancer.extra['members'] = pool.members
+        # if 'members' in balancer.extra: # now is always true
+        ret = []
+        for member_id in balancer.extra['members']:
+            ret.append(self.ex_get_member(member_id))
+        return ret
 
     def ex_list_pools(self):
         # TODO self.openstack.ex_list_loadbalancer
@@ -428,6 +437,16 @@ class OpenStackLBDriver(Driver):
                                 neutron_obj['health_monitors_status'],
                                 self )
 
+    def ex_get_member(self, member_id):
+        nmember = self.neutron.show_member(member_id)
+        return self._to_member(nmember['member'])
+
+    def _to_member(self, neutron_member):
+        already_included = ('id', 'address', 'protocol_port')
+        extras = self._get_extra_dict(neutron_member, already_included)
+        return Member(neutron_member['id'], neutron_member['address'],
+                      neutron_member['protocol_port'], extra=extras)
+
     def ex_get_vip(self, vid):
         v = self.neutron.show_vip(vid)
         if v is None:
@@ -466,11 +485,25 @@ class OpenStackLBDriver(Driver):
                                 neutron_obj['port_id'],
                                 self )
 
+    def _get_extra_dict(self, properties, ignore_fields):
+        extras = {}
+        if isinstance(properties, dict):
+            for key in properties.iterkeys():
+                if key not in ignore_fields:
+                    extras[key] = properties[key]
+        else: # to inspect object's attributes
+            for attr in dir(properties):
+                if not attr.startswith("_") and attr not in ignore_fields:
+                    at_val = properties.__getattribute__(attr)
+                    if not hasattr(at_val, '__call__'): # not a function
+                        extras[attr] = at_val
+        return extras
+
     def ex_create_member(self, pool_id, member):
-        node = {'address':member.ip, 
-            'protocol_port':member.port, 
-            'pool_id':pool_id, 
-            'admin_state_up':True}
+        node = {'address':member.ip,
+                'protocol_port':member.port,
+                'pool_id':pool_id,
+                'admin_state_up':True}
         # Member object
         weight = member.extra.get('weight')
         if weight:
