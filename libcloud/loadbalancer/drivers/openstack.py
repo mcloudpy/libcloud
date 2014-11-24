@@ -146,7 +146,8 @@ class OpenStackLBDriver(Driver):
         #            break
         # TODO fix with balancer data?
         pool = self.ex_get_pool(balancer_id)
-        return self._to_loadbalancer(pool)
+        vip = self.ex_get_vip_by_pool_id(balancer_id)
+        return self._to_loadbalancer(pool, vip=vip)
 
     def create_balancer(self, name, port, protocol, algorithm, members,
                         ex_region=None, ex_address=None,
@@ -295,13 +296,40 @@ class OpenStackLBDriver(Driver):
         :return: Member after joining the balancer.
         :rtype: :class:`Member`
         """
-        assert len(node.private_ips)==1, "The node has more than one private addresses. " + \
-                    "This driver does not know how to discern which to use in the Load Balancer. " + \
-                    "Try adding the one you choose using 'balancer_attach_member' instead."
-        ip = node.private_ips[0]
-        # I have added this warning to avoid changing LoadBalancers' attach_compute_node method.
-        print "WARNING. If you want to balance other port than the 80, please use the 'balancer_attach_member' method."
-        return self.balancer_attach_member(balancer, Member(None, ip, 80))
+        member = self._node_to_member(node, balancer)
+        return self.balancer_attach_member(balancer, member)
+
+
+    def _node_to_member(self, node, balancer):
+        """
+        Return a Member object based on a Node.
+
+        :param  node: Node object
+        :type   node: :class:`Node`
+
+        :keyword  balancer: The balancer the member is attached to.
+        :type     balancer: :class:`LoadBalancer`
+
+        :return:  Member object
+        :rtype:   :class:`Member`
+        """
+        # A balancer can have a node as a member, even if the node doesn't
+        # exist.  In this case, 'node' is simply a string to where the resource
+        # would be found if it was there.
+        member_ip = None
+        if hasattr(node, 'name'):
+            # We could also assert len(node.private_ips)==1
+            # Or show a message like:
+            #  """The node has more than one private addresses.
+            #     This driver does not know how to discern which to use in the Load Balancer.
+            #     Try adding the one you choose using 'balancer_attach_member' instead."""
+            member_ip = node.private_ips[0]
+        
+        extra = {'node': node}
+        # We could also show a warning message such as:
+        # "WARNING. If you want to balance other port than the 80, please use the 'balancer_attach_member' method."
+        return Member(id=None, ip=member_ip, port=balancer.port,
+                      balancer=balancer, extra=extra)
 
     def balancer_attach_member(self, balancer, member):
         """
@@ -492,11 +520,24 @@ class OpenStackLBDriver(Driver):
         return Member(neutron_member['id'], neutron_member['address'],
                       neutron_member['protocol_port'], extra=extras)
 
+    def ex_list_vips(self):
+        # TODO self.openstack.ex_list_loadbalancer
+        # no me aclaro con self.connection
+        # intento hacer a "http://bor.deusto.es:9696/v2.0/lb/pools.json",
+        # pero toma de base bor.deusto.es:8774/v2/a79090daa2d8497389eb610f26a51870
+        return self.neutron.list_vips()['vips']
+
     def ex_get_vip(self, vid):
         v = self.neutron.show_vip(vid)
         if v is None:
             return None
         return self._to_vip(v['vip'])
+
+    def ex_get_vip_by_pool_id(self, pool_id):
+        for v in self.ex_list_vips():
+            if pool_id ==  v['pool_id']:
+                return self._to_vip(v)
+        return None
 
     def ex_create_vip(self, name, port, protocol, subnet_id, pool_id,
                       session_affinity=None, session_cookie_name=None):
@@ -550,34 +591,44 @@ class OpenStackLBDriver(Driver):
                         extras[attr] = at_val
         return extras
     
-    # TODO add monitors' management!
+    def ex_create_healthcheck(self, *args, **kwargs):
+        pass
 
-    def _node_to_member(self, node, balancer):
+    def ex_list_healthchecks(self):
+        pass
+
+    def ex_balancer_attach_healthcheck(self, balancer, healthcheck):
         """
-        Return a Member object based on a Node.
+        Attach a healthcheck to balancer
 
-        :param  node: Node object
-        :type   node: :class:`Node`
+        :param balancer: LoadBalancer which should be used
+        :type  balancer: :class:`LoadBalancer`
 
-        :keyword  balancer: The balancer the member is attached to.
-        :type     balancer: :class:`LoadBalancer`
+        :param healthcheck: Healthcheck to add
+        :type  healthcheck: :class:`GCEHealthCheck`
 
-        :return:  Member object
-        :rtype:   :class:`Member`
+        :return: True if successful
+        :rtype:  ``bool``
         """
-        # A balancer can have a node as a member, even if the node doesn't
-        # exist.  In this case, 'node' is simply a string to where the resource
-        # would be found if it was there.
-        if hasattr(node, 'name'):
-            member_id = node.name
-            member_ip = node.public_ips[0]
-        else:
-            member_id = node
-            member_ip = None
+        pass
 
-        extra = {'node': node}
-        return Member(id=member_id, ip=member_ip, port=balancer.port,
-                      balancer=balancer, extra=extra)
+    def ex_balancer_detach_healthcheck(self, balancer, healthcheck):
+        """
+        Detach healtcheck from balancer
+
+        :param balancer: LoadBalancer which should be used
+        :type  balancer: :class:`LoadBalancer`
+
+        :param healthcheck: Healthcheck to remove
+        :type  healthcheck: :class:`GCEHealthCheck`
+
+        :return: True if successful
+        :rtype: ``bool``
+        """
+        pass
+
+    def ex_balancer_list_healthchecks(self, balancer):
+        pass
 
 #===============================================================================
 # "status":"ACTIVE",
