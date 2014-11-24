@@ -314,9 +314,12 @@ class OpenStackLBDriver(Driver):
         :rtype: :class:`Member`
         """
         node = {'pool_id':balancer.id}
-        nmember = self.neutron.update_member(member.id, {'member':node})
-        return None if nmember is None else self._to_member(nmember['member'])
-    
+        if member.id is None:
+            return self.ex_create_member(balancer.id, member) # it's also attached
+        else:
+            nmember = self.neutron.update_member(member.id, {'member':node})
+            return None if nmember is None else self._to_member(nmember['member'])
+
     def balancer_detach_member(self, balancer, member):
         """
         Detach member from balancer (i.e., in OpenStack deletes it).
@@ -466,6 +469,8 @@ class OpenStackLBDriver(Driver):
         return self._to_member(nmember['member'])
 
     def ex_create_member(self, pool_id, member):
+        assert member.ip, "The member should have an IP address."
+        assert member.port, "The member should have a port."
         node = {'address':member.ip,
                 'protocol_port':member.port,
                 'pool_id':pool_id,
