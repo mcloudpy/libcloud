@@ -344,10 +344,10 @@ class OpenStackLBDriver(Driver):
         :return: Member after joining the balancer.
         :rtype: :class:`Member`
         """
-        node = {'pool_id':balancer.id}
         if member.id is None:
             return self.ex_create_member(balancer.id, member) # it's also attached
         else:
+            node = {'pool_id':balancer.id}
             nmember = self.neutron.update_member(member.id, {'member':node})
             return None if nmember is None else self._to_member(nmember['member'])
 
@@ -590,45 +590,104 @@ class OpenStackLBDriver(Driver):
                     if not hasattr(at_val, '__call__'): # not a function
                         extras[attr] = at_val
         return extras
-    
-    def ex_create_healthcheck(self, *args, **kwargs):
-        pass
 
-    def ex_list_healthchecks(self):
-        pass
+    def ex_list_health_monitor(self):
+        ret = []
+        for healthmonitors in self.neutron.list_health_monitors()['health_monitors']:
+            ret.append(self._to_health_monitor(healthmonitors))
+        return ret
 
-    def ex_balancer_attach_healthcheck(self, balancer, healthcheck):
+    def ex_get_health_monitor(self, health_monitor_id):
+        ret = []
+        hm = self.neutron.show_health_monitor(health_monitor_id)['health_monitor']
+        return self._to_health_monitor(hm)
+
+    def ex_balancer_list_health_monitor(self, balancer):
+        pool = self.ex_get_pool(balancer.id)
+        ret = []
+        for hm_id in pool.health_monitors:
+            ret.append(self.ex_get_health_monitor(hm_id))
+        return ret
+
+    def ex_create_health_monitor(self, healthmonitor):
+        hm = {'type':healthmonitor.type,
+              'delay':healthmonitor.delay,
+              'timeout':healthmonitor.timeout,
+              'max_retries':healthmonitor.max_retries,
+              'admin_state_up':healthmonitor.admin_state_up}
+        if hm['type']=='HTTP' or hm['type']=='HTTPS':
+            assert  healthmonitor.ex_status!=None and \
+                    healthmonitor.ex_http_method!=None and \
+                    healthmonitor.ex_url_path!=None and \
+                    healthmonitor.ex_expected_codes!=None, \
+                    "If the type is HTTP or HTTPS, you have to provide the extended arguments."
+            hm['status'] = healthmonitor.ex_status
+            hm['http_method'] = healthmonitor.ex_http_method
+            hm['url_path'] = healthmonitor.ex_url_path
+            hm['expected_codes'] = healthmonitor.ex_expected_codes
+        hm_obj = self.neutron.create_health_monitor({'health_monitor':hm})
+        return None if hm_obj is None else self._to_health_monitor(hm_obj['health_monitor'])
+
+    def ex_delete_health_monitor(self, health_monitor_id):
+        self.neutron.delete_health_monitor(health_monitor_id)
+        # TODO Capture the exception it throws if something goes wrong.
+        return True
+
+    def ex_balancer_attach_health_monitor(self, balancer, healthmonitor):
         """
         Attach a healthcheck to balancer
 
         :param balancer: LoadBalancer which should be used
         :type  balancer: :class:`LoadBalancer`
 
-        :param healthcheck: Healthcheck to add
-        :type  healthcheck: :class:`GCEHealthCheck`
+        :param health_monitor: HealthMonitor to add
+        :type  health_monitor: :class:`OpenStack_2_HealthMonitor`
 
         :return: True if successful
         :rtype:  ``bool``
         """
-        pass
+        if healthmonitor.id is None:
+            self.ex_create_health_monitor(healthmonitor)
+        body = {'health_monitor': {'id': healthmonitor.id}}
+        self.neutron.associate_health_monitor(balancer.id, body)
+        # If everything went successful (and no exceptions where thrown...)
+        balancer.extra['health_monitors'].append(healthmonitor.id)
+        healthmonitor.pools.append(balancer.id)
+        return True
 
-    def ex_balancer_detach_healthcheck(self, balancer, healthcheck):
+    def ex_balancer_detach_health_monitor(self, balancer, healthmonitor):
         """
         Detach healtcheck from balancer
 
         :param balancer: LoadBalancer which should be used
         :type  balancer: :class:`LoadBalancer`
 
-        :param healthcheck: Healthcheck to remove
-        :type  healthcheck: :class:`GCEHealthCheck`
+        :param healthmonitor: HealthMonitor to remove
+        :type  healthmonitor: :class:`OpenStack_2_HealthMonitor`
 
         :return: True if successful
         :rtype: ``bool``
         """
-        pass
+        self.neutron.disassociate_health_monitor(balancer.id, healthmonitor.id)
+        # If everything went successful (and no exceptions where thrown...)
+        balancer.extra['health_monitors'].remove(healthmonitor.id)
+        healthmonitor.pools.remove(balancer.id)
+        return True
 
-    def ex_balancer_list_healthchecks(self, balancer):
-        pass
+    def _to_health_monitor(self, neutron_obj):
+        return OpenStack_2_HealthMonitor( neutron_obj['id'],
+                                neutron_obj['tenant_id'],
+                                neutron_obj['type'],
+                                neutron_obj['delay'],
+                                neutron_obj['timeout'],
+                                neutron_obj['max_retries'],
+                                neutron_obj['admin_state_up'],
+                                self,
+                                # TODO Contains more data: 'status', 'status_description' and 'pool_id'
+                                [p['pool_id'] for p in neutron_obj['pools']] if 'pools' in neutron_obj else None,
+                                neutron_obj['http_method'] if 'http_method' in neutron_obj else None,
+                                neutron_obj['url_path'] if 'url_path' in neutron_obj else None,
+                                neutron_obj['expected_codes'] if 'expected_codes' in neutron_obj else None )
 
 #===============================================================================
 # "status":"ACTIVE",
@@ -697,7 +756,7 @@ class OpenStack_2_VIP(object):
 # health_monitors_status.
 #===============================================================================
 class OpenStack_2_Pool(object):
-    """A OpenStack VIP class."""
+    """A OpenStack Pool class."""
     def __init__(self, id, name, description, status, protocol, admin_state_up,
                  lb_method, subnet_id, vip_id, provider, status_description,
                  members, health_monitors, health_monitors_status,
@@ -730,3 +789,39 @@ class OpenStack_2_Pool(object):
     def __repr__(self):
         return '<OpenStack_2_Pool id="%s" name="%s" protocol="%s" status="%s">' % (
             self.id, self.name, self.protocol, self.status)
+
+class OpenStack_2_HealthMonitor(object):
+    """A OpenStack Health Monitor."""
+    def __init__(self, id, tenant_id, type, delay, timeout, max_retries,
+                 admin_state_up, driver, pools=None, http_method=None,
+                 url_path=None, expected_codes=None):
+        # FIXME version differences:
+        #    The v2 from the documentation has "status" but not "pools".
+        #    The version from OS Icehouse returns "pools" but not "status".
+        assert type in ('PING', 'TCP', 'HTTP', 'HTTPS'), \
+                        "Type must be PING, TCP, HTTP or HTTPS."
+        self.id = str(id)
+        self.tenant_id = tenant_id
+        self.type = type
+        self.delay = delay
+        self.timeout = timeout
+        self.max_retries = max_retries
+        self.admin_state_up = admin_state_up
+        self.driver = driver
+        self.pools = pools
+        self.http_method = http_method
+        self.url_path = url_path
+        self.expected_codes = expected_codes        
+
+    def destroy(self):
+        """
+        Destroy this orphaned  Health Monitor.
+
+        :return:  True if successful
+        :rtype:   ``bool``
+        """
+        return self.driver.ex_delete_health_monitor(self.id)
+
+    def __repr__(self):
+        return '<OpenStack_2_HealthMonitor id="%s" tenant_id="%s" type="%s">' % (
+            self.id, self.tenant_id, self.type)
