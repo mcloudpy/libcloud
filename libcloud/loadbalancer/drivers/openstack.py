@@ -295,6 +295,7 @@ class OpenStackLBDriver(Driver):
         :return: Member after joining the balancer.
         :rtype: :class:`Member`
         """
+        self.neutron.update_member(member)
         add_node = balancer.extra['targetpool'].add_node(node)
         if add_node:
             return self._node_to_member(node, balancer)
@@ -312,11 +313,10 @@ class OpenStackLBDriver(Driver):
         :return: Member after joining the balancer.
         :rtype: :class:`Member`
         """
-        node = member.extra.get('node') or self._get_node_from_ip(member.ip)
-        add_node = balancer.extra['targetpool'].add_node(node)
-        if add_node:
-            return self._node_to_member(node, balancer)
-
+        node = {'pool_id':balancer.id}
+        nmember = self.neutron.update_member(member.id, {'member':node})
+        return None if nmember is None else self._to_member(nmember['member'])
+    
     def balancer_detach_member(self, balancer, member):
         """
         Detach member from balancer (i.e., in OpenStack deletes it).
