@@ -295,10 +295,13 @@ class OpenStackLBDriver(Driver):
         :return: Member after joining the balancer.
         :rtype: :class:`Member`
         """
-        self.neutron.update_member(member)
-        add_node = balancer.extra['targetpool'].add_node(node)
-        if add_node:
-            return self._node_to_member(node, balancer)
+        assert len(node.private_ips)==1, "The node has more than one private addresses. " + \
+                    "This driver does not know how to discern which to use in the Load Balancer. " + \
+                    "Try adding the one you choose using 'balancer_attach_member' instead."
+        ip = node.private_ips[0]
+        # I have added this warning to avoid changing LoadBalancers' attach_compute_node method.
+        print "WARNING. If you want to balance other port than the 80, please use the 'balancer_attach_member' method."
+        return self.balancer_attach_member(balancer, Member(None, ip, 80))
 
     def balancer_attach_member(self, balancer, member):
         """
