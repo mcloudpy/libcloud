@@ -56,10 +56,16 @@ class OpenStackLBDriver(Driver):
 
     def __init__(self, *args, **kwargs):
         self.openstack = OpenStack_1_1_NodeDriver(*args, **kwargs)
-        
-        ex_force_auth_url = "http://bor.deusto.es:35357/v2.0" # FIXME
-        self.neutron = nclient.Client('2.0', username=self.openstack.key, password=self.openstack.secret, tenant_name=self.openstack._ex_tenant_name, auth_url=ex_force_auth_url)
-
+        # TODO It should check ex_force_auth_version before and
+        # throw an exception it is not the 2.0 version.  
+        auth_url = kwargs['ex_force_auth_url']
+        if not auth_url.endswith("/"):
+            auth_url += "/"
+        auth_url = "%sv2.0" % auth_url
+        self.neutron = nclient.Client('2.0', username=self.openstack.key,
+                                      password=self.openstack.secret,
+                                      tenant_name=self.openstack._ex_tenant_name,
+                                      auth_url=auth_url)
         self.connection = self.openstack.connection
         self.__create_algorithm_to_value_map()
 
